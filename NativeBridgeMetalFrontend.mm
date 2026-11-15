@@ -5,7 +5,6 @@
 // Every result comes from the runtime and the GPU: a refused call returns nil/NO with the runtime's reason, an encoder call the runtime
 // refuses fails its command buffer (status Error, handlers run) instead of being dropped. A selector this frontend does not implement is
 // reported through the missing-selector hook before the usual exception, so a hardware run names the gap.
-// Shared events work within this process (no cross-process handle yet). Not yet implemented here: heaps, argument buffers, indirect commands, drawables/presentation.
 #import <Foundation/Foundation.h>
 #import <Metal/Metal.h>
 #import <IOSurface/IOSurfaceRef.h>
@@ -635,6 +634,11 @@ __attribute__((weak)) volatile uint32_t native_prime_rate;
 __attribute__((weak)) volatile uint32_t native_prime_functions_resumed;
 __attribute__((weak)) volatile uint32_t native_prime_libraries_primed;   // libraries this process's passes compiled
 __attribute__((weak)) volatile uint32_t native_prime_libraries_skipped;  // other GPUs' driver bundles (whole system) or not loaded here
+__attribute__((weak)) volatile uint32_t native_prime_pass_complete;
+__attribute__((weak)) volatile uint32_t native_prime_libraries_failed;
+__attribute__((weak)) volatile uint32_t native_prime_functions_refused;
+__attribute__((weak)) volatile uint32_t native_prime_functions_skipped;
+__attribute__((weak)) volatile uint32_t native_prime_inventory_failed;
 __attribute__((weak)) volatile uint32_t native_prime_scope;              // 0 no pass yet, 1 loaded bundles only, 2 the whole system
 }
 static void refuseSurface(uint32_t step,IOSurfaceRef surface,MTLTextureDescriptor *d,NSUInteger plane,uint64_t offset,uint64_t row) {
@@ -872,7 +876,7 @@ static NSData *compileMetalSource(NSString *source,NSString *arguments,NSString 
  memcpy(request.data()+16,text.bytes,text.length);memcpy(request.data()+16+sourceBytes,options,optionBytes);
  return codeGenRequest(13,request,warnings,failure);
 }
-// The front end's arguments for a set of compile options, as Metal passes them: the language version, fast math (Metal's default),
+// The front end's arguments for a set of compile options, as Metal passes them: the language version, math mode and FP32 functions,
 // invariance, size optimization and the preprocessor macros; module caches in this process's temporary directory, which a sandboxed
 // client may write.
 static NSString *compileArgument(NSString *text) {
@@ -885,8 +889,26 @@ static NSString *compileArguments(MTLCompileOptions *options) {
  const NSUInteger version=options && options.languageVersion?(NSUInteger)options.languageVersion:(NSUInteger)MTLLanguageVersion3_1;
  const unsigned major=(unsigned)(version>>16),minor=(unsigned)(version&0xffff);
  [arguments addObject:[NSString stringWithFormat:major>=3?@"-std=metal%u.%u":@"-std=ios-metal%u.%u",major,minor]];
- const BOOL fast=options?((BOOL (*)(id,SEL))objc_msgSend)(options,sel_registerName("fastMathEnabled")):YES;
- [arguments addObject:fast?@"-ffast-math":@"-fno-fast-math"];
+ const SEL modeSelector=sel_registerName("mathMode"),functionsSelector=sel_registerName("mathFloatingPointFunctions");
+ NSString *modeName=nil,*functionsName=nil;
+ if([options respondsToSelector:modeSelector] && [options respondsToSelector:functionsSelector]) {
+  switch(((NSInteger (*)(id,SEL))objc_msgSend)(options,modeSelector)) {
+   case MTLMathModeSafe:modeName=@"safe";break;
+   case MTLMathModeRelaxed:modeName=@"relaxed";break;
+   case MTLMathModeFast:modeName=@"fast";break;
+  }
+  switch(((NSInteger (*)(id,SEL))objc_msgSend)(options,functionsSelector)) {
+   case MTLMathFloatingPointFunctionsFast:functionsName=@"fast";break;
+   case MTLMathFloatingPointFunctionsPrecise:functionsName=@"precise";break;
+  }
+ }
+ if(modeName && functionsName) {
+  [arguments addObject:[@"-fmetal-math-mode=" stringByAppendingString:modeName]];
+  [arguments addObject:[@"-fmetal-math-fp32-functions=" stringByAppendingString:functionsName]];
+ } else {
+  const BOOL fast=options?((BOOL (*)(id,SEL))objc_msgSend)(options,sel_registerName("fastMathEnabled")):YES;
+  [arguments addObject:fast?@"-ffast-math":@"-fno-fast-math"];
+ }
  if(options.preserveInvariance)[arguments addObject:@"-fpreserve-invariance"];
  if(options.optimizationLevel==MTLLibraryOptimizationLevelSize)[arguments addObject:@"-Os"];
  [options.preprocessorMacros enumerateKeysAndObjectsUsingBlock:^(NSString *name,NSObject *value,BOOL *) {
@@ -1583,7 +1605,46 @@ static void noteUnalignedTexture(MTLTextureDescriptor *d,NSUInteger offset,NSUIn
 @end
 @implementation NBFunctionConstant
 @end
+@interface NBFunctionAttribute : NSObject
+@property(nonatomic,copy) NSString *name;
+@property(nonatomic) NSUInteger attributeIndex;
+@property(nonatomic) MTLDataType attributeType;
+@property(nonatomic,getter=isActive) BOOL active;
+@property(nonatomic,getter=isPatchData) BOOL patchData;
+@property(nonatomic,getter=isPatchControlPointData) BOOL patchControlPointData;
+@end
+@implementation NBFunctionAttribute
+@end
+static void libraryAirBytes(NBLibrary *library,const void *bytes,size_t length) {
+ const uint8_t *file=(const uint8_t *)bytes;
+ library.bytes=file;library.length=length;
+ if(length<8 || memcmp(file,"\xca\xfe\xba\xbe",4))return;
+ auto word=[&](size_t at) {return ((uint32_t)file[at]<<24)|((uint32_t)file[at+1]<<16)|((uint32_t)file[at+2]<<8)|file[at+3];};
+ const uint32_t count=word(4);
+ if(count>(length-8)/20)return;
+ for(uint32_t i=0;i<count;i++) {
+  const size_t at=8+20*(size_t)i;if(at>length || length-at<20)return;
+  if(word(at)!=0x01000017)continue;
+  const size_t offset=word(at+8),size=word(at+12);
+  if(offset>length || size>length-offset)return;
+  library.bytes=file+offset;library.length=size;return;
+ }
+}
 @implementation NBFunction
+- (NSArray *)stageInputAttributes {
+ if(!_handle)return nil;
+ int32_t count=nmb_function_attribute_count(_handle);if(count<=0)return nil;
+ NSMutableArray *attributes=[NSMutableArray arrayWithCapacity:count];
+ for(int32_t i=0;i<count;i++) {
+  char name[1024];uint64_t facts[5]={};
+  size_t length=nmb_function_attribute_at(_handle,(uint32_t)i,name,sizeof name,facts);
+  if(!length || length>sizeof name)return nil;
+  NBFunctionAttribute *a=[NBFunctionAttribute new];a.name=@(name);a.attributeIndex=facts[0];a.attributeType=(MTLDataType)facts[1];
+  a.active=facts[2];a.patchData=facts[3];a.patchControlPointData=facts[4];[attributes addObject:a];
+ }
+ return attributes;
+}
+- (NSArray *)vertexAttributes {return self.functionType==MTLFunctionTypeVertex?[self stageInputAttributes]:nil;}
 - (NSDictionary<NSString *,MTLFunctionConstant *> *)functionConstantsDictionary {
  NSMutableDictionary *result=[NSMutableDictionary dictionary];
  if(!_handle)return result;
@@ -1758,6 +1819,14 @@ static NSError *functionLookupError(NBLibrary *library, NSString *name, NSString
  }
  return names;
 }
+- (NSArray<NSString *> *)nb_primeFunctionNames {
+ NSMutableArray<NSString *> *names=[NSMutableArray array];
+ if(!forEachLibraryEntry(self,[&](const std::string &entry,int type) {
+  if((type==0 || type==2) && !entry.empty())[names addObject:@(entry.c_str())];
+  return true;
+ }))return self.functionNames;
+ return names;
+}
 // _MTLLibrary's externFunctionNames: the entries of external linkage (TYPE 5), an empty array for a library without any. iPadOS 27's Core
 // Image collects the precompiled kernels' names so (DAGPrecompiledKernels: [CIKernelLibrary externFunctionNames] of ci_stdlib and
 // ci_filters) and links a kernel into its DAG only when its name is there or in a stitchable library; without the answer (nil, an unknown
@@ -1788,6 +1857,7 @@ static NSError *functionLookupError(NBLibrary *library, NSString *name, NSString
  NmbFunction *handle=name?nmb_function_new_zero_constants(_handle,name.UTF8String):nullptr;
  if(!handle)return nil;
  NBFunction *function=[NBFunction new];function.handle=handle;function.name=name;function.sourceName=name;function.functionType=(MTLFunctionType)nmb_function_type(handle);
+ function.library=self;
  return (id<MTLFunction>)function;
 }
 @end
@@ -4543,7 +4613,7 @@ static void fillBaseLimits(id device);
  const uint64_t libraryBegan=nowUs();
  NmbLibrary *handle=nmb_library_new(gDevice,bytes,size,false);gTimeLibrary.add(libraryBegan);
  if(!handle)return failWith<id<MTLLibrary>>(error,@"library",nil);
- NBLibrary *library=[NBLibrary new];library.handle=handle;library.storage=mapped;library.bytes=(const uint8_t *)bytes;library.length=size;
+ NBLibrary *library=[NBLibrary new];library.handle=handle;library.storage=mapped;libraryAirBytes(library,bytes,size);
  if(error)*error=nil;return (id<MTLLibrary>)library;
 }
 // A library file that cannot be read (macOS run36: QuartzCore's default.metallib failed with NSCocoaErrorDomain 260 on a fresh Data
@@ -4568,7 +4638,7 @@ static void reportUnreadableLibrary(NSString *path) {
  const uint64_t libraryBegan=nowUs();
  NmbLibrary *handle=nmb_library_new(gDevice,bytes.bytes,bytes.length,false);gTimeLibrary.add(libraryBegan);
  if(!handle)return failWith<id<MTLLibrary>>(error,@"library",nil);
- NBLibrary *library=[NBLibrary new];library.handle=handle;library.storage=bytes;library.bytes=(const uint8_t *)bytes.bytes;library.length=bytes.length;
+ NBLibrary *library=[NBLibrary new];library.handle=handle;library.storage=bytes;libraryAirBytes(library,bytes.bytes,bytes.length);
  if(error)*error=nil;return (id<MTLLibrary>)library;
 }
 - (id<MTLLibrary>)newLibraryWithURL:(NSURL *)url error:(NSError **)error {
@@ -5499,18 +5569,21 @@ extern "C" size_t native_bridge_metal_telemetry(char *out,size_t size) {
     row("V vkpipe n=%llu total=%llums max=%llums waited=%llums failed=%llu",(ull)work[0],ms(work[1]),ms(work[2]),ms(work[3]),(ull)work[4]);
    row("V cache hit%llu miss%llu wr%llu | msg i%llu w%llu",(ull)work[7],(ull)work[8],(ull)work[9],(ull)work[5],(ull)work[6]);
   }
-  // The shader cache's full counts (nmb_device_shader_cache_detail): functions found/translated, compute and render pipelines found/compiled, entries
+  // The shader cache's full counts (nmb_device_shader_cache_detail): functions found/translated, driver data found/unchanged, render pipelines found/compiled, entries
   // rejected, unreadable, handed to the directory (queued, written on the asking thread), bytes written, failed writes, evictions, the driver's own
   // pipeline cache: loads, saves, hits, misses.
   uint64_t sc[24]={};
   if(nmb_device_shader_cache_detail(gDevice,sc)) {
-   row("SC fn %llu/%llu cp %llu/%llu rp %llu/%llu rej %llu rd-fail %llu",(ull)sc[2],(ull)sc[3],(ull)sc[4],(ull)sc[5],(ull)sc[6],(ull)sc[7],
+   row("SC fn %llu/%llu data %llu/%llu rp %llu/%llu rej %llu rd-fail %llu",(ull)sc[2],(ull)sc[3],(ull)sc[4],(ull)sc[5],(ull)sc[6],(ull)sc[7],
     (ull)sc[8],(ull)sc[9]);
    row("SCb wr %llu q %llu thr %llu %lluK wfail %llu evict %llu qhit %llu | drv load %llu save %llu hit %llu miss %llu",(ull)sc[10],(ull)sc[11],
     (ull)sc[12],(ull)(sc[13]>>10),(ull)sc[15],(ull)sc[16],(ull)sc[14],(ull)sc[17],(ull)sc[20],(ull)sc[18],(ull)sc[19]);
+   row("SCc drv truncated %llu mismatched %llu",(ull)sc[21],(ull)sc[22]);
   }
  }
  row("PR compiling=%u libs=%u/%u made=%u rate=%u resumed=%u",native_prime_compiling,native_prime_libraries_done,native_prime_libraries_total,native_prime_made,native_prime_rate,native_prime_functions_resumed);
+ row("PRc state=%u failed=%u refused=%u bad=%u missing=%u",native_prime_pass_complete,native_prime_libraries_failed,
+  native_prime_functions_refused,native_prime_functions_skipped,native_prime_inventory_failed);
  // Priming's reach and the system shader cache. PRb: the pass's scope (1 the bundles loaded here, 2 the whole system), the libraries
  // it compiled itself, those it leaves out (other GPUs' driver bundles, or not loaded here), the system cache's state here (0 not
  // named, 1 read, 2 filled by this process, 3 refused) and what this process published: the entries and KiB its cache directory
@@ -5526,6 +5599,13 @@ extern "C" size_t native_bridge_metal_telemetry(char *out,size_t size) {
    row("SY read %llu/%lluK rej %llu refused %llu replies %llu",(ull)sy[0],(ull)(sy[3]>>10),(ull)sy[1],(ull)sy[2],(ull)gCompileSystem.load());
  }
  if(gDevice) {
+  uint64_t fast[15]={};
+  if(nmb_device_fast_path_counts(gDevice,fast)) {
+   row("FP group %llu/%llu pools %llu/%llu linear %llu/%llu evict %llu",(ull)fast[0],(ull)fast[1],(ull)fast[2],(ull)fast[3],
+    (ull)fast[4],(ull)fast[5],(ull)fast[6]);
+   row("CM calls %llu us %llu/%llu/%llu/%llu/%llu/%llu/%llu",(ull)fast[7],(ull)fast[8],(ull)fast[9],(ull)fast[10],(ull)fast[11],
+    (ull)fast[12],(ull)fast[13],(ull)fast[14]);
+  }
   // The warm pass (records warmed, failed, unread, KiB of driver data) and where work ran: scheduler passes and batches at commit, render
   // log waits, encoder ends on the lowering thread.
   uint64_t flow[8]={};
