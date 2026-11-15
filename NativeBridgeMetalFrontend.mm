@@ -580,7 +580,7 @@ static bool isRenderServer() {return nativeIsRenderServer();}
 static void endRenderServerAfterGpuLoss() {
  static std::atomic<bool> ending{false};
  if(!isRenderServer() || ending.exchange(true))return;
- NBLOG(@"native-metal: the render server's GPU context is lost; ending backboardd so launchd starts it again");
+ NBLOG(@"native-metal: the render server's GPU context is lost; ending %s so launchd starts it again",NATIVE_RENDER_SERVER);
  dispatch_after(dispatch_time(DISPATCH_TIME_NOW,(int64_t)(500*NSEC_PER_MSEC)),dispatch_get_global_queue(QOS_CLASS_USER_INTERACTIVE,0),^{
   kill(getpid(),SIGTERM);
  });
@@ -3179,6 +3179,11 @@ static char kUserDictionaryKey;
 - (void)setProtectionOptions:(uint64_t)options {if(options)[self refuse:[NSString stringWithFormat:@"protection options 0x%llx",options]];}
 - (void)refuse:(NSString *)what {
  if(!self.encodeFailure){self.encodeFailure=what;NBLOG(@"native-metal: command buffer refused: %@",what);}
+ // The runtime recovers a lost GPU in place (a new VkDevice): what the render server made before that is refused from then on
+ // (MadeBeforeRecovery) while CoreAnimation goes on encoding with it, and the display stays frozen (sheng macOS, 2026-11-15:
+ // WindowServer refused thousands of command buffers a minute after a GPU hang, its command buffers failing as GpuRecoveryVictim,
+ // Metal code 1, never 11). End it as for a lost device; launchd starts it again.
+ if([what rangeOfString:@"MadeBeforeRecovery"].location!=NSNotFound)endRenderServerAfterGpuLoss();
 }
 - (MTLCommandBufferStatus)status {
  if(self.failedLocally)return MTLCommandBufferStatusError;
