@@ -46,6 +46,12 @@ After a discard: NonVolatile places the resource again and answers Empty; a quer
 
 `gpu-purge=0` keeps the state without discarding anything (`NATIVE_METAL_PURGE=0` selects the same in a process).
 
+## No-copy buffers over freed memory
+
+A buffer made with `newBufferWithBytesNoCopy:` is either an import of the caller's pages or, where the runtime imports no second mapping of pages a live import already holds in part, a copy of them. The runtime compares a copy with the caller's pages at each commit that may reach it, and a command buffer whose functions read addresses may reach every copy.
+
+Core Animation's render server frees or remaps memory under no-copy buffers that still live in its caches. On macOS the runtime asks the kernel whether a copy's pages are mapped before each comparison (`0064-copies-leave-unreachable-pages-alone.patch`): a copy whose pages cannot be read is not compared at a commit and takes no base, and a completion merges nothing into pages that cannot be written. The copy keeps its bytes and is compared again once the pages are mapped.
+
 ## Video surface textures
 
 A two-plane YCbCr texture over an IOSurface (a video frame: `MTLPixelFormatYCBCR8_420_2P` or `YCBCR10_420_2P` over plane 0, which QuartzCore asks for on a device of the Apple families) of `ShaderRead` usage alone is made over the surface's planes: a function that samples it reads the planes' own bytes through the no-copy import and converts them as Metal does, and no converted image of the picture's size (63 MiB in half floats for 3840 x 2160, with a staging copy of the planes) is made or kept. A binding that cannot read the planes in place (a `read()`, a gather, a comparison) makes the image at that binding; any other call that names the texture (a blit, a view, `getBytes`) makes the texture with its image, as before, and uses that from then on. Textures of another usage, format or plane, and those whose planes the device cannot view as a texel buffer, are made with their image. The surface stays imported and counted in use while a command buffer in flight names its texture.
